@@ -1,0 +1,45 @@
+# ---------------------
+# Node / Frontend
+# ---------------------
+node_modules/
+dist/
+.build/
+.next/
+out/
+
+# ---------------------
+# Python / Backend
+# ---------------------
+venv/
+__pycache__/
+*.pyc
+.env
+
+# ---------------------
+# AI / YOLO outputs
+# ---------------------
+uploads/
+alerts/
+runs/
+results/
+*.pt
+*.onnx
+
+# ---------------------
+# Images & Videos (IMPORTANT ✅)
+# ---------------------
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.mp4
+*.avi
+
+# ---------------------
+# OS / Editor junk
+# ---------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
