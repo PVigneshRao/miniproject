@@ -1,245 +1,249 @@
-# database.py
 import os
-from typing import List, Dict, Any, Optional
+import uuid
+import bcrypt
+from typing import Optional, Dict, Any
 
 import mysql.connector
 from mysql.connector import Error
 
-# --- MySQL CONFIG ---------------------------------------------------------
-
+# ------------------------------------------------
+# MYSQL DATABASE CONFIGURATION
+# Reads database credentials from environment variables
+# ------------------------------------------------
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "root"),  # you said password = root
+    "password": os.getenv("DB_PASSWORD", "root"),
     "database": os.getenv("DB_NAME", "wildlife_ai"),
     "port": int(os.getenv("DB_PORT", "3306")),
 }
 
 
 def get_connection():
-    """Create a new MySQL connection."""
+    """
+    Creates and returns a new connection to the MySQL database.
+    """
     return mysql.connector.connect(**DB_CONFIG)
 
-
-# --- INSERT HELPERS -------------------------------------------------------
-
-
-def insert_detection(
-    timestamp: str,
-    label: str,
-    confidence: float,
-    x: float,
-    y: float,
-    w: float,
-    h: float,
-    alert_sent: int = 0,
-) -> None:
+# ------------------------------------------------
+# PASSWORD UTILITIES
+# ------------------------------------------------
+def hash_password(password: str) -> str:
     """
-    Insert one row into detections table.
+    Encrypts the plain-text password using bcrypt hashing.
+    This ensures passwords are never stored in plain text.
+    """
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-    detections(
-        id INT PK AUTO_INCREMENT,
-        timestamp DATETIME NOT NULL,
-        label VARCHAR(128) NOT NULL,
-        confidence FLOAT NOT NULL,
-        x FLOAT, y FLOAT, w FLOAT, h FLOAT,
-        alert_sent TINYINT(1) DEFAULT 0
-    )
+
+def verify_password(password: str, hashed: str) -> bool:
+    """
+    Verifies user-entered password with stored hashed password.
+    Used during login.
+    """
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+# ------------------------------------------------
+# USER DATABASE FUNCTIONS
+# ------------------------------------------------
+def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches a user record using username (email).
+    Used during login and registration validation.
     """
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        sql = """
-        INSERT INTO detections
-        (timestamp, label, confidence, x, y, w, h, alert_sent)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
+    except Error as e:
+        print("DB error get_user_by_username:", e)
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def create_user(username: str, password: str, name: str, email: str, phone: str) -> Dict[str, Any]:
+    """
+    Creates a new user in the database.
+    Password is securely hashed before storage.
+    """
+    password_hash = hash_password(password)
+
+    try:
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+
         cur.execute(
-            sql,
-            (timestamp, label, float(confidence), float(x), float(y), float(w), float(h), int(alert_sent)),
+            """
+            INSERT INTO users (username, password_hash, name, email, phone)
+            VALUES (%s,%s,%s,%s,%s)
+            """,
+            (username, password_hash, name, email, phone),
         )
         conn.commit()
+
+        # Fetch and return the created user
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
+
     except Error as e:
-        print("DB error insert_detection:", e)
+        print("DB error create_user:", e)
+        raise
     finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+        cur.close()
+        conn.close()
 
 
-def insert_alert(
-    animal: str,
-    confidence: float,
-    image_path: str,
-    is_read: int = 0,
-) -> None:
+def update_user_token(user_id: int) -> str:
     """
-    Insert one row into alerts table.
-
-    alerts(
-        id INT PK AUTO_INCREMENT,
-        animal VARCHAR(100),
-        confidence FLOAT,
-        image_path TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_read TINYINT(1) DEFAULT 0
-    )
+    Generates a unique session token for the user.
+    Used for token-based authentication.
     """
+    token = str(uuid.uuid4())
     try:
         conn = get_connection()
         cur = conn.cursor()
-        sql = """
-        INSERT INTO alerts (animal, confidence, image_path, is_read)
-        VALUES (%s, %s, %s, %s)
-        """
-        cur.execute(sql, (animal, float(confidence), image_path, int(is_read)))
+        cur.execute("UPDATE users SET token=%s WHERE id=%s", (token, user_id))
         conn.commit()
+        return token
     except Error as e:
-        print("DB error insert_alert:", e)
+        print("DB error update_user_token:", e)
+        return ""
     finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+        cur.close()
+        conn.close()
 
 
-def insert_log(
-    user_id: Optional[int],
-    animal: str,
-    confidence: float,
-    image_path: str,
-    message: str,
-) -> None:
+def ensure_admin_exists():
     """
-    Insert one row into logs table.
-
-    logs(
-        id INT PK AUTO_INCREMENT,
-        user_id INT,
-        animal VARCHAR(100),
-        confidence FLOAT,
-        image_path TEXT,
-        message TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
+    Ensures a default admin user exists in the system.
+    Automatically created when backend starts for first time.
     """
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        sql = """
-        INSERT INTO logs (user_id, animal, confidence, image_path, message)
-        VALUES (%s, %s, %s, %s, %s)
-        """
-        cur.execute(
-            sql,
-            (user_id, animal, float(confidence), image_path, message),
+    if not get_user_by_username("admin"):
+        print("[INIT] Creating default admin user")
+        create_user(
+            username="admin",
+            password="admin123",
+            name="Administrator",
+            email="admin@wildlife.ai",
+            phone="+919999999999",
         )
-        conn.commit()
-    except Error as e:
-        print("DB error insert_log:", e)
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
 
-
-# --- FETCH HELPERS --------------------------------------------------------
-
-
-def fetch_alerts(limit: int = 50) -> List[Dict[str, Any]]:
+# ------------------------------------------------
+# DETECTION / ALERT / LOG FUNCTIONS
+# ------------------------------------------------
+def insert_detection(timestamp, label, confidence, x, y, w, h, alert_sent=0):
     """
-    Return latest alerts as a list of dicts.
+    Stores each detected animal with bounding box and confidence.
     """
-    rows: List[Dict[str, Any]] = []
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        sql = """
-        SELECT id, animal, confidence, image_path, timestamp, is_read
-        FROM alerts
-        ORDER BY timestamp DESC
-        LIMIT %s
-        """
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    except Error as e:
-        print("DB error fetch_alerts:", e)
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-    return rows
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO detections
+           (timestamp,label,confidence,x,y,w,h,alert_sent)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (timestamp, label, confidence, x, y, w, h, alert_sent),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def mark_all_alerts_read() -> None:
+def insert_alert(animal, confidence, image_path, is_read=0):
     """
-    Set is_read = 1 for all alerts.
+    Stores alert record when dangerous animal is detected.
     """
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE alerts SET is_read = 1 WHERE is_read = 0")
-        conn.commit()
-    except Error as e:
-        print("DB error mark_all_alerts_read:", e)
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO alerts (animal,confidence,image_path,is_read) VALUES (%s,%s,%s,%s)",
+        (animal, confidence, image_path, is_read),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def fetch_logs(limit: int = 200) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        sql = """
-        SELECT id, user_id, animal, confidence, image_path, message, timestamp
-        FROM logs
-        ORDER BY timestamp DESC
-        LIMIT %s
-        """
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    except Error as e:
-        print("DB error fetch_logs:", e)
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-    return rows
+def insert_log(user_id, animal, confidence, image_path, message):
+    """
+    Stores application activity logs for tracking & auditing.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO logs (user_id,animal,confidence,image_path,message) VALUES (%s,%s,%s,%s,%s)",
+        (user_id, animal, confidence, image_path, message),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
-def fetch_detections(limit: int = 500) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        sql = """
-        SELECT id, timestamp, label, confidence, x, y, w, h, alert_sent
-        FROM detections
-        ORDER BY timestamp DESC
-        LIMIT %s
-        """
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    except Error as e:
-        print("DB error fetch_detections:", e)
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-    return rows
+def fetch_alerts(limit=50):
+    """
+    Fetches recent alerts for display in dashboard.
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT %s", (limit,))
+    data = cur.fetchall()
+    cur.close()
+    conn.close()
+    return data
+
+
+def fetch_logs(limit=200):
+    """
+    Fetches recent system logs.
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM logs ORDER BY timestamp DESC LIMIT %s", (limit,))
+    data = cur.fetchall()
+    cur.close()
+    conn.close()
+    return data
+
+
+def fetch_detections(limit=500):
+    """
+    Fetches recent detection history.
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM detections ORDER BY timestamp DESC LIMIT %s", (limit,))
+    data = cur.fetchall()
+    cur.close()
+    conn.close()
+    return data
+
+
+def mark_all_alerts_read():
+    """
+    Marks all alerts as read (used after viewing alerts).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE alerts SET is_read=1 WHERE is_read=0")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_user_by_token(token: str):
+    """
+    Fetches user details using authentication token.
+    Used for securing detection endpoint.
+    """
+    conn = get_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT id, name, email, phone FROM users WHERE token=%s",
+        (token,)
+    )
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user

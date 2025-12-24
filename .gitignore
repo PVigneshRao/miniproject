@@ -1,25 +1,17 @@
 # ---------------------
 # Node / Frontend
 # ---------------------
-node_modules/
-dist/
-.build/
-.next/
-out/
 
 # ---------------------
 # Python / Backend
 # ---------------------
 venv/
-__pycache__/
-*.pyc
 .env
 
 # ---------------------
 # AI / YOLO outputs
 # ---------------------
-uploads/
-alerts/
+
 runs/
 results/
 *.pt

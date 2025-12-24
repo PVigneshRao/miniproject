@@ -1,16 +1,25 @@
-# main.py
 import os
 import io
 import time
+import smtplib
 from datetime import datetime
-from typing import List, Dict, Any
+from email.message import EmailMessage
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image, ImageDraw, ImageFont
+from pydantic import BaseModel
+from PIL import Image
 from dotenv import load_dotenv
+from twilio.rest import Client
 
+# 🔗 Import database helper functions
 from database import (
+    get_user_by_username,
+    get_user_by_token,
+    create_user,
+    verify_password,
+    update_user_token,
+    ensure_admin_exists,
     insert_detection,
     insert_alert,
     insert_log,
@@ -20,179 +29,266 @@ from database import (
     mark_all_alerts_read,
 )
 
-# ------------------------------------------------------------------------
-load_dotenv()
-
-# ✅ Danger classes (UPDATED)
-DANGER_CLASSES = {"lion", "tiger", "elephant", "human"}
+# --------------------------------------------------
+# ENVIRONMENT VARIABLES & CONSTANTS
+# --------------------------------------------------
+load_dotenv()                  # Load .env file values
+ensure_admin_exists()          # Create admin user if not present
 
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "15"))
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Animals considered dangerous
+DANGER_CLASSES = {"lion", "tiger", "elephant"}
 
-# ------------------------------------------------------------------------
-# FASTAPI
-# ------------------------------------------------------------------------
+# ✅ DEMO SMS NUMBER (used only for demonstration)
+DEMO_SMS_NUMBER = os.getenv("DEMO_SMS_NUMBER")
+
+# --------------------------------------------------
+# TWILIO SMS SETUP
+# --------------------------------------------------
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_SMS_FROM = os.getenv("TWILIO_SMS_FROM")
+
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_SMS_FROM:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print("[TWILIO] SMS client ready")
+else:
+    print("[TWILIO] SMS disabled")
+
+# --------------------------------------------------
+# FASTAPI APP SETUP
+# --------------------------------------------------
 app = FastAPI(title="Wildlife AI Backend")
 
+# Enable frontend-backend communication (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_origins=["http://localhost:8080"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------
-# LOAD YOLO
-# ------------------------------------------------------------------------
+# --------------------------------------------------
+# YOLO MODEL LOADING
+# --------------------------------------------------
 try:
     from ultralytics import YOLO
     model = YOLO(MODEL_PATH)
-    print(f"[YOLO] Loaded model: {MODEL_PATH}")
+    print("[YOLO] Model loaded:", MODEL_PATH)
 except Exception as e:
     print("[YOLO ERROR]", e)
     model = None
 
+# Used to avoid sending too many alerts continuously
 _last_alert_time = 0.0
 
-# ------------------------------------------------------------------------
-# HELPERS
-# ------------------------------------------------------------------------
-def run_inference(img: Image.Image, conf_thres: float = 0.35):
-    if model is None:
+# --------------------------------------------------
+# AUTH REQUEST MODELS
+# --------------------------------------------------
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    phone: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# --------------------------------------------------
+# AUTHENTICATION APIs
+# --------------------------------------------------
+@app.post("/auth/register")
+def register(req: RegisterRequest):
+    """
+    Registers a new user into the system.
+    """
+    username = req.email.lower()
+
+    if get_user_by_username(username):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    create_user(username, req.password, req.name, req.email, req.phone)
+    user = get_user_by_username(username)
+    token = update_user_token(user["id"])
+
+    return {"token": token, "user": user}
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    """
+    Validates user login credentials and generates a session token.
+    """
+    user = get_user_by_username(req.email.lower())
+
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = update_user_token(user["id"])
+    return {"token": token, "user": user}
+
+# --------------------------------------------------
+# YOLO IMAGE INFERENCE
+# --------------------------------------------------
+def run_inference(img: Image.Image):
+    """
+    Runs YOLO object detection on a frame.
+    Returns detected objects with bounding boxes.
+    """
+    if not model:
         return []
 
     import numpy as np
+    results = model(np.array(img), imgsz=512)
 
-    results = model(np.array(img), imgsz=512, conf=conf_thres)
     detections = []
-
     for r in results:
-        if r.boxes is None:
-            continue
-
-        for box in r.boxes:
-            cls_id = int(box.cls[0])
-            label = model.names.get(cls_id, str(cls_id))  # ✅ label
-            conf = float(box.conf[0])
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-            detections.append({
-                "label": label,
-                "confidence": conf,
-                "bbox": [x1, y1, x2, y2]
-            })
-
+        if r.boxes:
+            for b in r.boxes:
+                detections.append({
+                    "label": model.names[int(b.cls[0])],
+                    "confidence": float(b.conf[0]),
+                    "bbox": b.xyxy[0].tolist(),
+                })
     return detections
 
+# --------------------------------------------------
+# SMS ALERT FUNCTION (DEMO SAFE ✅)
+# --------------------------------------------------
+def send_sms_alert(animal: str, confidence: float, ts: str):
+    """
+    Sends SMS alert to a fixed demo number (Twilio trial safe).
+    """
+    if not twilio_client or not DEMO_SMS_NUMBER:
+        print("[SMS] Skipped")
+        return
 
-def draw_boxes(img: Image.Image, detections):
-    draw = ImageDraw.Draw(img)
+    body = (
+        "🚨 Wildlife Detection Alert\n\n"
+        f"Animal Detected : {animal.upper()}\n"
+        f"Confidence      : {confidence:.2f}\n"
+        f"Time            : {ts}\n\n"
+        "Please take immediate action."
+    )
 
     try:
-        font = ImageFont.truetype("arial.ttf", 16)
-    except:
-        font = ImageFont.load_default()
+        twilio_client.messages.create(
+            from_=TWILIO_SMS_FROM,
+            to=DEMO_SMS_NUMBER,
+            body=body
+        )
+        print(f"[SMS] Sent to demo number {DEMO_SMS_NUMBER}")
+    except Exception as e:
+        print("[SMS ERROR]", e)
 
-    for d in detections:
-        x1, y1, x2, y2 = d["bbox"]
-        label = f'{d["label"]} {int(d["confidence"] * 100)}%'
+# --------------------------------------------------
+# EMAIL ALERT FUNCTION
+# --------------------------------------------------
+def send_email_alert(to_email: str, animal: str, confidence: float, ts: str):
+    """
+    Sends email alert to the logged-in user.
+    """
+    email_from = os.getenv("EMAIL_FROM")
+    email_pass = os.getenv("EMAIL_PASSWORD")
 
-        draw.rectangle([x1, y1, x2, y2], outline=(52, 199, 89), width=3)
+    if not email_from or not email_pass:
+        print("[EMAIL] Disabled")
+        return
 
-        tb = draw.textbbox((x1, y1), label, font=font)
-        tw, th = tb[2]-tb[0], tb[3]-tb[1]
-        draw.rectangle([x1, y1-th-6, x1+tw+6, y1], fill=(52,199,89))
-        draw.text((x1+3, y1-th-3), label, fill=(0,0,0), font=font)
+    msg = EmailMessage()
+    msg["Subject"] = f"🚨 Wildlife Alert: {animal.upper()}"
+    msg["From"] = email_from
+    msg["To"] = to_email
 
-    return img
+    msg.set_content(
+        f"""
+Wildlife Detection Alert
 
+Animal Detected : {animal}
+Confidence      : {confidence:.2f}
+Time            : {ts}
 
-# ------------------------------------------------------------------------
-# ROUTES
-# ------------------------------------------------------------------------
+Please take immediate action.
+"""
+    )
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(email_from, email_pass)
+            server.send_message(msg)
+        print("[EMAIL] Sent")
+    except Exception as e:
+        print("[EMAIL ERROR]", e)
+
+# --------------------------------------------------
+# MAIN DETECTION API
+# --------------------------------------------------
 @app.post("/detect")
-async def detect(file: UploadFile = File(...)):
+async def detect(
+    file: UploadFile = File(...),
+    token: str = Header(None)
+):
+    """
+    Receives video frame, runs detection,
+    stores data, and triggers alerts if needed.
+    """
     global _last_alert_time
 
-    try:
-        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-    except:
-        raise HTTPException(status_code=400, detail="Invalid image")
+    # Authenticate user using token
+    user = get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # Read image from request
+    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
     detections = run_inference(img)
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Timestamps
+    ts_db = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ts_msg = datetime.now().strftime("%d/%m/%Y %I:%M %p")
 
-    # ✅ Store detections
+    # Store detection data
     for d in detections:
         x1, y1, x2, y2 = d["bbox"]
-
         insert_detection(
-            timestamp=ts,
-            label=d["label"],
-            confidence=d["confidence"],
-            x=x1, y=y1,
-            w=x2-x1, h=y2-y1,
-            alert_sent=0
+            ts_db,
+            d["label"],
+            d["confidence"],
+            x1,
+            y1,
+            x2 - x1,
+            y2 - y1,
+            user["id"]
         )
+        insert_log(user["id"], d["label"], d["confidence"], "", "frame detection")
 
-        insert_log(
-            user_id=None,
-            animal=d["label"],
-            confidence=d["confidence"],
-            image_path="",
-            message="frame detection"
-        )
-
-    # ✅ ALERT LOGIC
-    now = time.time()
+    # Filter dangerous animals
     danger = [d for d in detections if d["label"].lower() in DANGER_CLASSES]
+    now = time.time()
 
-    if danger and (now - _last_alert_time) >= ALERT_COOLDOWN_SECONDS:
-        boxed = draw_boxes(img.copy(), detections)
-        filename = f"alert_{int(now)}.jpg"
-        path = os.path.join(UPLOAD_DIR, filename)
-        boxed.save(path)
-
+    # Send alerts only after cooldown
+    if danger and now - _last_alert_time >= ALERT_COOLDOWN_SECONDS:
         top = max(danger, key=lambda x: x["confidence"])
+        insert_alert(top["label"], top["confidence"], user["id"])
 
-        insert_alert(
-            animal=top["label"],
-            confidence=top["confidence"],
-            image_path=path,
-            is_read=0
-        )
+        send_sms_alert(top["label"], top["confidence"], ts_msg)
 
-        insert_log(
-            user_id=None,
-            animal=top["label"],
-            confidence=top["confidence"],
-            image_path=path,
-            message="DANGER ALERT"
-        )
+        if user.get("email"):
+            send_email_alert(user["email"], top["label"], top["confidence"], ts_msg)
 
         _last_alert_time = now
 
-    # ✅ RESPONSE FIX (THIS FIXES UNDEFINED)
-    return {
-        "detections": [
-            {
-                "label": d["label"],
-                "confidence": float(d["confidence"]),
-                "bbox": [float(v) for v in d["bbox"]]
-            }
-            for d in detections
-        ]
-    }
+    return {"detections": detections}
 
-
-# ------------------------------------------------------------------------
-# ALERTS / LOGS APIs
-# ------------------------------------------------------------------------
+# --------------------------------------------------
+# DATA FETCH APIs
+# --------------------------------------------------
 @app.get("/alerts")
 def get_alerts(limit: int = 50):
     return {"alerts": fetch_alerts(limit)}
